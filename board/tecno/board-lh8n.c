@@ -12,13 +12,6 @@
 void board_early_init(void) {
     printf("Entering early init for Tecno Pova 5 Pro 5G\n");
 	
-	// - Volume Up → Recovery
-    // - Volume Down → Fastboot
-    if (mtk_detect_key(VOLUME_UP)) {
-        set_bootmode(BOOTMODE_RECOVERY);
-    } else if (mtk_detect_key(VOLUME_DOWN)) {
-        set_bootmode(BOOTMODE_FASTBOOT);
-    }
 }
 
 void board_late_init(void) {
