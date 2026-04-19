@@ -5,14 +5,26 @@
 
 #include <board_ops.h>
 
+#define VOLUME_UP 17
+#define VOLUME_DOWN 1
+#define POWER_KEY 8
+
 void board_early_init(void) {
     printf("Entering early init for Tecno Pova 5 Pro 5G\n");
+	
+	// - Volume Up → Recovery
+    // - Volume Down → Fastboot
+    if (mtk_detect_key(VOLUME_UP)) {
+        set_bootmode(BOOTMODE_RECOVERY);
+    } else if (mtk_detect_key(VOLUME_DOWN)) {
+        set_bootmode(BOOTMODE_FASTBOOT);
+    }
 }
 
 void board_late_init(void) {
     printf("Entering late init for Tecno Pova 5 Pro 5G\n");
-
-    uint32_t addr = 0;
+	
+	uint32_t addr = 0;
 
     // Suppresses the bootloader unlock warning shown during boot on
     // unlocked devices. In addition to the visual warning, it also
