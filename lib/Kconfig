@@ -315,6 +315,27 @@ menu "Storage Support"
         hex "mt_part_get_device() address"
         depends on USE_MT_PART_API || USE_LEGACY_PARTITION_API || STORAGE_SUPPORT
 
+    config MT_PART_USER_PART_ID
+        int "Storage area for the user partitions (dev->read/write 'part')"
+        default 8
+        help
+            Which storage area dev->read()/dev->write() are given for the
+            partitions of the GPT. MTK's eMMC loader uses 8 here, UFS
+            devices use a different id (LH8n: 3). LK prints its own value
+            at boot as "[GPT_LK] user part id = N" -- read it there when
+            porting to a new device.
+
+    config STORAGE_BLOCK_SIZE
+        int "Size of one storage LBA in bytes"
+        default 512
+        help
+            The unit dev->read()/dev->write() are addressed in, and the
+            unit the GPT stores its header and entry LBAs in. eMMC
+            loaders use 512, UFS devices use 4096 (LH8n: 4096). Check it
+            against LK's own "[GPT_LK]" partition dump: only one of
+            512/4096 turns a printed nr_sects into the partition size the
+            kernel reports.
+
     config MT_PART_GET_PARTITION_ADDRESS
         hex "mt_part_get_partition() address"
         depends on USE_MT_PART_API

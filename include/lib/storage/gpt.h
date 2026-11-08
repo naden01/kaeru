@@ -7,12 +7,15 @@
 #pragma once
 
 #include <inttypes.h>
+#include <lib/mt_part.h>
 
 #define GPT_MAX_PARTS    128
 #define GPT_NAME_MAX     36
 #define GPT_HEADER_LBA   1
 #define GPT_ENTRY_LBA    2
-#define GPT_BLOCK_SIZE   512
+/* One LBA: storage_part_read_block() reads exactly BLOCK_SIZE bytes, so the
+ * entry array has to be walked in BLOCK_SIZE chunks. */
+#define GPT_BLOCK_SIZE   BLOCK_SIZE
 
 #define PARTS_MAX         GPT_MAX_PARTS
 #define PART_NAME_MAX     GPT_NAME_MAX

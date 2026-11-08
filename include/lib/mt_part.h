@@ -8,10 +8,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLOCK_SIZE 512
+#define BLOCK_SIZE CONFIG_STORAGE_BLOCK_SIZE
 
 #define BOOT0_PART 1
-#define USER_PART  8
+#define USER_PART  CONFIG_MT_PART_USER_PART_ID
 
 #ifdef CONFIG_USE_PMT_PARTITION
 
