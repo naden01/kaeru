@@ -1,0 +1,62 @@
+# Tecno KL5n (MT6768) -- scaffold port.
+#
+# Created with ./setup.sh, then filled in by hand following the porting section of
+# README-LH8N.md. Addresses are grouped by how much they are trusted; see the
+# README for the techniques (prologue check, BL-target scan, string xrefs).
+
+CONFIG_BOOTLOADER_BASE=0x4C400000
+CONFIG_BOOTLOADER_SIZE=0x19C9FC
+CONFIG_TECNO_KL5N=y
+CONFIG_MEDIATEK_MT6768=y
+
+# --- detected by setup.sh, then verified by disassembly (clean prologues) ---
+CONFIG_FASTBOOT_INFO_ADDRESS=0x4C42C0FC
+CONFIG_FASTBOOT_PUBLISH_ADDRESS=0x4C42BD88
+CONFIG_FASTBOOT_REGISTER_ADDRESS=0x4C42BD4C
+CONFIG_FASTBOOT_CONTINUE_ADDRESS=0x4C42DAE8
+CONFIG_VIDEO_PRINTF_ADDRESS=0x4C439898
+CONFIG_DPRINTF_ADDRESS=0x4C439CB8
+CONFIG_MALLOC_ADDRESS=0x4C43A9B4
+CONFIG_FREE_ADDRESS=0x4C43A0E8
+CONFIG_PARTITION_GET_SIZE_BY_NAME_ADDRESS=0x4C456890
+CONFIG_PLATFORM_INIT_ADDRESS=0x4C403A2C
+CONFIG_THREAD_CREATE_ADDRESS=0x4C427D78
+CONFIG_THREAD_RESUME_ADDRESS=0x4C427F8C
+CONFIG_LK_LOG_STORE_ADDRESS=0x4C44FA4C
+CONFIG_INIT_STORAGE_CALLER=0x4C403A5C
+
+# --- derived here, cross-checked against LH8n's known-good values ---
+# init_storage: the target of the `bl` at INIT_STORAGE_CALLER.
+CONFIG_INIT_STORAGE_ADDRESS=0x4C40383C
+# The only caller of platform_init.
+CONFIG_PLATFORM_INIT_CALLER=0x4C427538
+# fail/okay: the functions that reference the "FAIL"/"OKAY" response strings.
+# This is the exact technique that reproduces LH8n's known 0x4822F6EC/0x4822F8C8.
+CONFIG_FASTBOOT_FAIL_ADDRESS=0x4C42C1A4
+CONFIG_FASTBOOT_OKAY_ADDRESS=0x4C42C9B0
+# The global the fastboot "continue" handler zeroes (BOOTMODE_NORMAL).
+CONFIG_BOOTMODE_ADDRESS=0x4C59C814
+
+# --- verified against this image (see the README's porting section) ---
+# app(): the LK keeps an app-descriptor table whose entries hold a name pointer
+# followed by the function pointer. Read the standalone "mt_boot" entry: the word
+# after the name field is the app entry. The same rule reproduces LH8n's known
+# 0x4822ECB8 exactly.
+CONFIG_APP_ADDRESS=0x4C42B74C
+# mtk_detect_key: disassembling this address yields 21 of LH8n's known
+# mtk_detect_key (0x4820478C) first 26 mnemonics, with the first 13 identical --
+# same source, slightly different compile. The same check rejects the
+# sibling-port guess (xiaomi/lancelot's 0x4C405A24 does not match at all).
+CONFIG_MTK_DETECT_KEY_ADDRESS=0x4C405904
+# partition_read: found in Ghidra by xref-ing the "partition read" error strings,
+# then decompiling. Its body is the contract kaeru expects -- partition name used
+# in an error message, offset + length bounds-checked against the partition size
+# (via partition_get_size and malloc from this same config), then a block-device
+# read with short-read detection. The sibling-port guess was wrong; this is not.
+CONFIG_PARTITION_READ_ADDRESS=0x4C457EF4
+
+CONFIG_CERT_BYPASS=y
+CONFIG_CERT_BYPASS_MODE="override"
+CONFIG_STAGE1_SUPPORT=y
+CONFIG_THREAD_SUPPORT=y
+CONFIG_FASTBOOT_STYLE_STANDARD=y
