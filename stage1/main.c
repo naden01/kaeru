@@ -9,7 +9,7 @@
 #include <stage1/lkloader.h>
 #include <stage1/memory.h>
 
-#define MAX_STAGE2_SIZE 128 * 1024
+#define MAX_STAGE2_SIZE 640 * 1024
 
 static inline void kaeru_stage1(void) {
     int ret = 0;

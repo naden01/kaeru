@@ -3,3 +3,9 @@ config TECNO_LH8N
     default n
     help
       Say Y if you want to include support for Tecno Pova 5 Pro 5G
+
+config TECNO_KL5N
+    bool "Support Tecno KL5n"
+    default n
+    help
+      Say Y if you want to include support for Tecno KL5n
