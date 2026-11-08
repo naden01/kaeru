@@ -677,6 +677,73 @@ static uint32_t badapple_ticks(void) {
     return ((uint32_t (*)(void))(0x4825F38C | 1))();
 }
 
+// Spin the clip on the panel until a key is pressed: the playback loop shared by
+// 'oem badapple' and the menu entry. 'start' is the wall-clock origin and 'shown'
+// the last frame already on screen (-1 when the screen is blank). The deltas
+// applied and the blits drawn come back for the caller's report.
+static void badapple_run(uint32_t start, uint32_t ticks_per_ms, uint32_t fps,
+                         uint32_t period_ms, int shown, uint32_t* out_advanced,
+                         uint32_t* out_drawn) {
+    uint32_t advanced = 0;
+    uint32_t drawn = 0;
+
+    // The frame index is derived from the wall clock, not from a per-frame
+    // delay: if a frame renders slowly we skip the ones we missed, so the clip
+    // always keeps the source's timing instead of playing back slow.
+    for (;;) {
+        if (mtk_detect_key(KEY_POWER) || mtk_detect_key(KEY_VOLUME_UP) ||
+            mtk_detect_key(KEY_VOLUME_DOWN)) {
+            break;
+        }
+
+        uint32_t elapsed_ms = ticks_per_ms ? (badapple_ticks() - start) / ticks_per_ms : 0;
+        uint32_t loop_ms = period_ms ? elapsed_ms % period_ms : 0;
+        int target = (int)((loop_ms * fps) / 1000);
+
+        if (target != shown) {
+            int err = 0;
+            uint32_t t0 = badapple_ticks();
+
+            // Apply every delta between what is on screen and now (cheap), then
+            // draw once.
+            while (shown != target) {
+                if (++shown >= BADAPPLE_FRAMES) {
+                    shown = 0;
+                    memset(badapple_frame, 0, sizeof(badapple_frame));
+                    badapple_clear();
+                    badapple_rect_reset();
+                }
+
+                if (badapple_unpack_frame(shown) != 0) {
+                    err = 1;
+                    break;
+                }
+
+                advanced++;
+            }
+
+            badapple_prof_unpack += badapple_ticks() - t0;
+
+            if (err) {
+                break;
+            }
+
+            t0 = badapple_ticks();
+            badapple_blit();
+            badapple_prof_blit += badapple_ticks() - t0;
+            drawn++;
+
+            // The screen is up to date now, so the next batch starts a new rect.
+            badapple_rect_reset();
+        }
+
+        mdelay(2);
+    }
+
+    *out_advanced = advanced;
+    *out_drawn = drawn;
+}
+
 static void cmd_badapple(const char* arg, void* data, unsigned sz) {
     const uint32_t ticks_per_ms = ((uint32_t (*)(uint32_t))(0x4825F500 | 1))(1);
     const uint32_t fps = BADAPPLE_FPS > 0 ? BADAPPLE_FPS : 30;
@@ -920,58 +987,7 @@ static void cmd_badapple(const char* arg, void* data, unsigned sz) {
     uint32_t advanced = 0;
     uint32_t drawn = 0;
 
-    // The frame index is derived from the wall clock, not from a per-frame
-    // delay: if a frame renders slowly we skip the ones we missed, so the clip
-    // always keeps the source's timing instead of playing back slow.
-    for (;;) {
-        if (mtk_detect_key(KEY_POWER) || mtk_detect_key(KEY_VOLUME_UP) ||
-            mtk_detect_key(KEY_VOLUME_DOWN)) {
-            break;
-        }
-
-        uint32_t elapsed_ms = ticks_per_ms ? (badapple_ticks() - start) / ticks_per_ms : 0;
-        uint32_t loop_ms = period_ms ? elapsed_ms % period_ms : 0;
-        int target = (int)((loop_ms * fps) / 1000);
-
-        if (target != shown) {
-            int err = 0;
-            uint32_t t0 = badapple_ticks();
-
-            // Apply every delta between what is on screen and now (cheap), then
-            // draw once.
-            while (shown != target) {
-                if (++shown >= BADAPPLE_FRAMES) {
-                    shown = 0;
-                    memset(badapple_frame, 0, sizeof(badapple_frame));
-                    badapple_clear();
-                    badapple_rect_reset();
-                }
-
-                if (badapple_unpack_frame(shown) != 0) {
-                    err = 1;
-                    break;
-                }
-
-                advanced++;
-            }
-
-            badapple_prof_unpack += badapple_ticks() - t0;
-
-            if (err) {
-                break;
-            }
-
-            t0 = badapple_ticks();
-            badapple_blit();
-            badapple_prof_blit += badapple_ticks() - t0;
-            drawn++;
-
-            // The screen is up to date now, so the next batch starts a new rect.
-            badapple_rect_reset();
-        }
-
-        mdelay(2);
-    }
+    badapple_run(start, ticks_per_ms, fps, period_ms, shown, &advanced, &drawn);
 
     // Measured pace: deltas/second lower than BADAPPLE_FPS means the renderer
     // (not the decoder) is the bottleneck and frames were skipped.
@@ -1073,7 +1089,7 @@ typedef struct {
 // calls LK's own mt_power_off routine (the one its "mt_power_off new" log line
 // comes from).
 //
-// The last three entries are kaeru's own. They are dispatched by hand in the
+// The last four entries are kaeru's own. They are dispatched by hand in the
 // menu thread (they are not LK functions), so their 'action' is unused.
 static const menu_item_t menu_items[] = {
         {"Reboot System", 0x48230A2D},      // LK cmd_continue
@@ -1083,6 +1099,8 @@ static const menu_item_t menu_items[] = {
         {"Backup boot images", 0},
         {"Restore boot images", 0},
         {"Flash staged image", 0},
+        {"Copy partition", 0},
+        {"Bad Apple!!", 0},
 };
 
 enum {
@@ -1093,6 +1111,8 @@ enum {
     MENU_BACKUP,
     MENU_RESTORE,
     MENU_FLASH,
+    MENU_COPY,
+    MENU_BADAPPLE,
 };
 
 #define MENU_COUNT ((int)ARRAY_SIZE(menu_items))
@@ -1114,6 +1134,10 @@ static const char* menu_doing(int sel) {
             return "Backing up - do not power off";
         case MENU_RESTORE:
             return "Restoring - do not power off";
+        case MENU_COPY:
+            return "Copying - do not power off";
+        case MENU_BADAPPLE:
+            return "Bad Apple!!";
         default:
             return "Flash staged image";
     }
@@ -1124,6 +1148,10 @@ static const char* menu_doing(int sel) {
 static int kbk_backup(int ui);
 static int kbk_restore(int ui);
 static void kst_pick(int ui);
+static void kcp_pick(int ui);
+
+// Active slot letter, defined below; the menu shows it on the footer rule.
+static char active_slot(void);
 
 // Field width for the menu. Lines are right-aligned within it (padded on the
 // LEFT), so every line's text ends at the same column: the block is flush
@@ -1171,7 +1199,42 @@ static void menu_calibrate(void) {
 
 // Power must be held this long to confirm, so a stray press during a flash
 // cannot reboot the device.
-#define MENU_HOLD_MS 1500
+#define MENU_HOLD_MS 1000
+
+// Key poll period while the menu and pickers are idle. A tap is only seen if it
+// is still down when the loop next samples the keys, so this bounds how short a
+// press can still be missed. 20 ms is well under a human tap.
+#define MENU_POLL_MS 20
+
+// Holding a volume key slides the selection: one step on the press, a pause, then
+// auto-repeat, so a tap moves once and a hold scrolls through the list.
+#define MENU_REPEAT_DELAY_MS 400
+#define MENU_REPEAT_MS       120
+
+// Main-menu box rows, on the MENU_COLS-wide field menu_line() writes.
+#define MENU_TOP     8
+#define MENU_STATUS  (MENU_TOP + MENU_COUNT + 2)   // blank line, reused for status
+#define MENU_HINT    (MENU_STATUS + 1)
+#define MENU_BOTTOM  (MENU_HINT + 1)
+
+// Stock video_printf() presents the whole 1080x2460 framebuffer after *every*
+// call -- LK's video_puts tail-calls mt_disp_update_rect(0, 0, width, height).
+// The menu redraws ~13 lines, so per-line printf means ~13 full-screen pushes
+// (about a second here) after each key press, and the menu does not poll keys
+// while a push is in flight. That is why taps were missed. Draw with the raw
+// putc, which only touches the text buffer, and present once per redraw.
+static void menu_putc(char c) {
+    ((void (*)(char))(0x4823C7BC | 1))(c);
+}
+
+// The menu and both pickers only draw rows 2..26 of LK's 8x16 text grid, so
+// presenting that band covers every write (menu_line pads each field and
+// kst_clear blanks the block). A full-screen present is ~74 ms against ~26 ms.
+#define MENU_BAND_H (27 * 16)
+
+static void menu_present(void) {
+    mt_disp_update_rect(0, 0, FB_WIDTH, MENU_BAND_H);
+}
 
 static void menu_line(int row, const char* s) {
     char buf[MENU_COLS + 1];
@@ -1198,31 +1261,210 @@ static void menu_line(int row, const char* s) {
     // Set the start column for every line: a newline puts the cursor back at
     // column 0.
     video_set_cursor(row, MENU_COL - MENU_COLS);
-    video_printf("%s\n", buf);
+
+    // Raw putc, not video_printf: printf would present the full panel here (see
+    // menu_putc). The caller presents once for the whole redraw instead.
+    for (int k = 0; k < MENU_COLS; k++) {
+        menu_putc(buf[k]);
+    }
+
+    menu_putc('\n');
+}
+
+// One line of the main-menu box: 'left'/'right' are the rails ('|', or '+' on a
+// rule) and 'body' is the text between them, padded to the inner width.
+static void menu_box_line(int row, char left, char right, const char* body) {
+    char buf[MENU_COLS + 1];
+    int len = 0;
+    int i = 0;
+
+    while (body[len] && len < MENU_COLS - 2) {
+        len++;
+    }
+
+    buf[i++] = left;
+
+    for (int k = 0; k < MENU_COLS - 2; k++) {
+        buf[i++] = (k < len) ? body[k] : ' ';
+    }
+
+    buf[i++] = right;
+    buf[i] = '\0';
+
+    menu_line(row, buf);
+}
+
+// A rule across the box with an optional centred label, e.g.
+// "+==== slot b active ====+". Empty text gives a plain rule.
+static void menu_rule_text(int row, const char* text) {
+    char body[MENU_COLS - 1];
+    int len = 0;
+    int pad;
+
+    while (text[len] && len < MENU_COLS - 4) {
+        len++;
+    }
+
+    pad = ((MENU_COLS - 2) - len) / 2;
+
+    for (int i = 0; i < MENU_COLS - 2; i++) {
+        body[i] = '=';
+    }
+
+    for (int i = 0; i < len; i++) {
+        body[pad + i] = text[i];
+    }
+
+    body[MENU_COLS - 2] = '\0';
+
+    menu_box_line(row, '+', '+', body);
+}
+
+static void menu_rule(int row) {
+    menu_rule_text(row, "");
 }
 
 static void menu_draw(int sel) {
     char line[64];
-    int r = 8;
+    char slot = active_slot();
 
-    // No video_clean_screen() here: the splash drawn from logo.bin stays up
-    // and the menu is rendered over it.
-    menu_line(r++, "========= kaeru boot menu =========");
-    menu_line(r++, "");
+    // No video_clean_screen() here: the splash drawn from logo.bin stays up and
+    // the menu is drawn as a box over it.
+    menu_rule_text(MENU_TOP, " kaeru boot menu ");
+    menu_box_line(MENU_TOP + 1, '|', '|', "      Tecno Pova 5 Pro 5G (LH8n)");
 
     for (int i = 0; i < MENU_COUNT; i++) {
         // 'label' is a pointer in a static table, and this payload only has its
         // GOT relocated (see the note below), so it is stale until rebased.
         const char* label = (const char*)((uintptr_t)menu_items[i].label + kaeru_reloc_delta);
-        npf_snprintf(line, sizeof(line), "%c %s", (i == sel) ? '>' : ' ', label);
-        menu_line(r++, line);
+        npf_snprintf(line, sizeof(line), " %s %s", (i == sel) ? ">>" : "  ", label);
+        menu_box_line(MENU_TOP + 2 + i, '|', '|', line);
     }
 
-    menu_line(r++, "");
-    menu_line(r++, " Volume Up/Down: move   Hold Power: select");
-    menu_line(r++, "");
+    menu_box_line(MENU_STATUS, '|', '|', "");
+    menu_box_line(MENU_HINT, '|', '|', " Vol: tap/hold  Power: hold to select");
 
-    mt_disp_update();
+    if (slot) {
+        npf_snprintf(line, sizeof(line), " slot %c active ", slot);
+        menu_rule_text(MENU_BOTTOM, line);
+    } else {
+        menu_rule(MENU_BOTTOM);
+    }
+
+    menu_present();
+}
+
+static void menu_draw_cb(int sel, void* ctx) {
+    (void)ctx;
+    menu_draw(sel);
+}
+
+// Tap-or-hold movement for a list: one step on the press (a tap moves once),
+// then auto-repeat while the key stays down, so a hold slides through the list.
+// 'draw' repaints whenever the selection moves. Returns 1 if it moved.
+static int menu_move_keys(int items, int* sel, void (*draw)(int sel, void* ctx), void* ctx) {
+    int voldn = mtk_detect_key(KEY_VOLUME_DOWN);
+    int volup = !voldn && mtk_detect_key(KEY_VOLUME_UP);
+    int key;
+    int dir;
+    int held = 0;
+
+    if (!voldn && !volup) {
+        return 0;
+    }
+
+    key = voldn ? KEY_VOLUME_DOWN : KEY_VOLUME_UP;
+    dir = voldn ? 1 : items - 1;  // +1 / -1 mod items
+
+    *sel = (*sel + dir) % items;
+    draw(*sel, ctx);
+
+    while (mtk_detect_key(key)) {
+        mdelay(MENU_POLL_MS);
+        held += MENU_POLL_MS;
+
+        if (held >= MENU_REPEAT_DELAY_MS) {
+            *sel = (*sel + dir) % items;
+            draw(*sel, ctx);
+            held -= MENU_REPEAT_MS;
+        }
+    }
+
+    return 1;
+}
+
+// True once Power has been held for MENU_HOLD_MS; waits for release first.
+static int menu_hold_power(void) {
+    int held = 0;
+
+    while (mtk_detect_key(KEY_POWER) && held < MENU_HOLD_MS) {
+        mdelay(MENU_POLL_MS);
+        held += MENU_POLL_MS;
+    }
+
+    if (held < MENU_HOLD_MS) {
+        return 0;
+    }
+
+    while (mtk_detect_key(KEY_POWER)) {
+        mdelay(MENU_POLL_MS);
+    }
+
+    return 1;
+}
+
+// Is the clip actually streamed in the partition? The blob carries no magic of
+// its own (utils/badapple.py writes only the deltas), so presence is a probe:
+// the partition has to hold the whole stream, and its first bytes must not read
+// back blank (all 0x00, or 0xFF on an erased one) -- no PackBits frame can
+// start with either. The offsets table is compiled in, so the length is exact.
+static int badapple_blob_missing(void) {
+    uint8_t probe[16];
+    uint8_t any = 0;
+    uint8_t all = 0xFF;
+
+    if (badapple_part_size() < badapple_offsets[BADAPPLE_FRAMES]) {
+        return 1;
+    }
+
+    if (badapple_part_read(BADAPPLE_PART_OFFSET, probe, sizeof(probe)) != (long)sizeof(probe)) {
+        return 1;
+    }
+
+    for (unsigned i = 0; i < sizeof(probe); i++) {
+        any |= probe[i];
+        all &= probe[i];
+    }
+
+    return any == 0 || all == 0xFF;
+}
+
+// The menu's Bad Apple entry: the same clip, drawn with the menu's own output
+// instead of fastboot INFO lines. Refused with a plain notice when nothing is
+// streamed in tranfs, the same short-circuit the staged-flash picker uses.
+static void badapple_menu(void) {
+    const uint32_t ticks_per_ms = ((uint32_t (*)(uint32_t))(0x4825F500 | 1))(1);
+    const uint32_t fps = BADAPPLE_FPS > 0 ? BADAPPLE_FPS : 30;
+    const uint32_t period_ms = ((uint32_t)BADAPPLE_FRAMES * 1000) / fps;
+    uint32_t advanced = 0;
+    uint32_t drawn = 0;
+
+    if (badapple_blob_missing()) {
+        menu_box_line(MENU_STATUS, '|', '|', " No Bad Apple stream in tranfs");
+        menu_present();
+        mdelay(2000);
+        return;
+    }
+
+    memset(badapple_frame, 0, sizeof(badapple_frame));
+
+    badapple_active = 1;
+    badapple_clear();
+    badapple_rect_reset();
+
+    badapple_run(badapple_ticks(), ticks_per_ms, fps, period_ms, -1, &advanced, &drawn);
+
+    badapple_active = 0;
 }
 
 // Runs alongside LK's fastboot loop: the menu never blocks fastboot, so the
@@ -1251,41 +1493,31 @@ static int menu_thread(void* arg) {
             continue;
         }
 
-        if (mtk_detect_key(KEY_VOLUME_DOWN)) {
-            while (mtk_detect_key(KEY_VOLUME_DOWN)) mdelay(20);
-            sel = (sel + 1) % MENU_COUNT;
-            dirty = 1;
-        } else if (mtk_detect_key(KEY_VOLUME_UP)) {
-            while (mtk_detect_key(KEY_VOLUME_UP)) mdelay(20);
-            sel = (sel + MENU_COUNT - 1) % MENU_COUNT;
-            dirty = 1;
+        if (menu_move_keys(MENU_COUNT, &sel, menu_draw_cb, NULL)) {
+            dirty = 0;  // menu_move_keys() already redrew
         } else if (mtk_detect_key(KEY_POWER)) {
             // Require a deliberate hold: a tap (e.g. an accidental bump while
             // flashing something) must not reboot the device.
-            menu_line(11 + MENU_COUNT, " Hold Power to confirm...");
-            mt_disp_update();
+            menu_box_line(MENU_STATUS, '|', '|', " Hold Power to confirm...");
+            menu_present();
 
-            int held = 0;
-
-            while (mtk_detect_key(KEY_POWER) && held < MENU_HOLD_MS) {
-                mdelay(20);
-                held += 20;
-            }
-
-            if (held >= MENU_HOLD_MS) {
-                while (mtk_detect_key(KEY_POWER)) mdelay(20);
-
+            if (menu_hold_power()) {
                 // Say where we are going and push it to the panel *before* running
                 // the action: the reboot normally never returns, and a
                 // command-mode panel only shows what has been pushed to it.
-                menu_line(11 + MENU_COUNT, menu_doing(sel));
-                mt_disp_update();
+                menu_box_line(MENU_STATUS, '|', '|', menu_doing(sel));
+                menu_present();
                 mdelay(400);
 
                 if (sel == MENU_FLASH) {
                     // The picker draws its own full block and blanks it before
                     // returning, so nothing is left on the main layout.
                     kst_pick(1);
+                } else if (sel == MENU_COPY) {
+                    kcp_pick(1);
+                } else if (sel == MENU_BADAPPLE) {
+                    // Plays on the panel and returns here when a key stops it.
+                    badapple_menu();
                 } else if (sel != MENU_BACKUP && sel != MENU_RESTORE) {
                     // The PMIC power-off sequence takes long enough for the
                     // watchdog to reset the SoC mid-way, which would look like a
@@ -1297,9 +1529,9 @@ static int menu_thread(void* arg) {
                     ((void (*)(const char*, void*, unsigned))(menu_items[sel].action))(NULL, NULL, 0);
 
                     // Only reached if the command came back instead of rebooting.
-                    menu_line(12 + MENU_COUNT,
-                              (sel == MENU_POWEROFF) ? "Power off done" : "Reboot done");
-                    mt_disp_update();
+                    menu_box_line(MENU_STATUS, '|', '|',
+                                  (sel == MENU_POWEROFF) ? "Power off done" : "Reboot done");
+                    menu_present();
                     mdelay(600);
 
                     break;
@@ -1309,10 +1541,10 @@ static int menu_thread(void* arg) {
                     // cycle.
                     int rc = (sel == MENU_BACKUP) ? kbk_backup(1) : kbk_restore(1);
 
-                    menu_line(12 + MENU_COUNT,
-                              rc ? "Failed - see the LK log"
-                                 : (sel == MENU_BACKUP) ? "Backup done" : "Restore done");
-                    mt_disp_update();
+                    menu_box_line(MENU_STATUS, '|', '|',
+                                  rc ? "Failed - see the LK log"
+                                     : (sel == MENU_BACKUP) ? "Backup done" : "Restore done");
+                    menu_present();
                     mdelay(900);
                 }
             }
@@ -1325,7 +1557,7 @@ static int menu_thread(void* arg) {
             menu_draw(sel);
         }
 
-        mdelay(100);
+        mdelay(MENU_POLL_MS);
     }
 
     return 0;
@@ -1536,7 +1768,7 @@ static int kbk_copy(const struct part_info* from, uint64_t from_off,
             npf_snprintf(line, sizeof(line), " %s - %u/%u MiB", what,
                          (unsigned)(done >> 20), (unsigned)(total >> 20));
             menu_line(row, line);
-            mt_disp_update();
+            menu_present();
         }
     }
 
@@ -1666,24 +1898,28 @@ static int kbk_restore(int ui) {
 }
 
 // ---------------------------------------------------------------------------
-// Flash a staged image from tranfs into any partition
+// Flash a staged image from tranfs into a partition
 //
 // The last-resort counterpart to the backup above: a user with a rooted Android
 // drops an image into a partition LK can still read when Android is gone, then
-// boots the menu and picks the partition to write it to. It shares the boot
-// backup's store -- the two cannot coexist, and staging overwrites whatever
-// backup was there (the magic at KBK_OFFSET tells them apart).
+// boots the menu and picks the boot image to write it to. The menu offers only
+// kst_allow; 'oem flash-staged' still takes any name the denylist allows.
+// Staging shares the boot backup's store -- the two cannot coexist, and staging
+// overwrites whatever backup was there (the magic at KBK_OFFSET tells them apart).
 //
-// The header is one text line, "KST1 <size> [<cksum>]", so the on-device
-// command is stock `cksum` plus two `dd`s, no PC:
+// The header is one text line, "KST1 <size> [<cksum> [<name>]]", so the
+// on-device command is stock `cksum` plus two `dd`s, no PC:
 //
 //   IMG=/sdcard/recovery.img; set -- $(cksum "$IMG")
-//   printf 'KST1 %s %s\n' "$2" "$1" | dd of=/dev/block/by-name/tranfs bs=4096 seek=$((0xC800000/4096)) conv=notrunc
+//   printf 'KST1 %s %s %s\n' "$2" "$1" "${IMG##*/}" | dd of=/dev/block/by-name/tranfs bs=4096 seek=$((0xC800000/4096)) conv=notrunc
 //   dd if="$IMG" of=/dev/block/by-name/tranfs bs=4096 seek=$((0xC801000/4096)) conv=fsync
 //
 // The checksum is optional: omit the second field for a size-only flash. When
 // present it is verified before anything is written, so a half-staged image
-// cannot be flashed over a good one.
+// cannot be flashed over a good one. The filename is display-only -- it lets the
+// menu say what is staged -- and is read only when the checksum is present, so a
+// name that starts with a digit cannot be mistaken for one. A header without it
+// (hand-rolled dd, older staging) just shows as "staged image".
 // ---------------------------------------------------------------------------
 #define KST_HEADER "KST1"
 
@@ -1763,11 +1999,18 @@ static int kst_crc_region(const struct part_info* part, uint64_t off, uint32_t n
 
 // Parse the header sector. Returns 0 and the image size, and the checksum (0
 // when the staging command left it out).
-static int kst_read_header(uint32_t* size, uint32_t* sum) {
+// Read the staged image's size and checksum. 'name' (optional, may be NULL) also
+// receives the staged filename when the header carries one -- see the staging
+// recipe above -- and is set to "" otherwise.
+static int kst_read_header(uint32_t* size, uint32_t* sum, char* name, size_t name_len) {
     const struct part_info* bak = storage_part_find(KBK_PART);
     char* p;
     char* end = NULL;
     unsigned long sz;
+
+    if (name && name_len) {
+        name[0] = '\0';
+    }
 
     if (!bak) {
         return -1;
@@ -1792,7 +2035,24 @@ static int kst_read_header(uint32_t* size, uint32_t* sum) {
     }
 
     *size = (uint32_t)sz;
-    *sum = (uint32_t)strtoul(end, NULL, 10);  // 0 when the field is absent
+    *sum = (uint32_t)strtoul(end, &p, 10);  // 0 when the field is absent
+
+    // The filename is whatever follows the checksum. It is read only when a
+    // checksum is present, so a name starting with a digit cannot parse as one.
+    if (name && name_len && *sum) {
+        size_t i = 0;
+
+        while (*p == ' ') {
+            p++;
+        }
+
+        while (*p && *p != '\r' && *p != '\n' && i < name_len - 1) {
+            name[i++] = *p++;
+        }
+
+        name[i] = '\0';
+    }
+
     return 0;
 }
 
@@ -1803,6 +2063,31 @@ static int kst_denied(const char* name) {
         const char* deny = (const char*)((uintptr_t)kst_deny[i] + kaeru_reloc_delta);
 
         if (strncmp(name, deny, strlen(deny)) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+// What the picker offers: the boot images a no-PC user restores this way, plus
+// the AVB metadata that has to be re-flashed alongside a re-signed boot image.
+// init_boot and dtbo are left out: this ROM keeps the generic ramdisk inside
+// 'boot' and its init_boot is 8 MiB of zeros (see the sanity check below), and
+// a wrong dtbo is recoverable the same way a wrong boot is.
+// Exact names, not prefixes -- a "boot" prefix would also pull in boot_para.
+// Rebased like kst_deny, for the same reason.
+static const char* const kst_allow[] = {
+        "boot_a", "boot_b", "vendor_boot_a", "vendor_boot_b",
+        "vbmeta_a", "vbmeta_b", "vbmeta_system_a", "vbmeta_system_b",
+        "vbmeta_vendor_a", "vbmeta_vendor_b",
+};
+
+static int kst_allowed(const char* name) {
+    for (unsigned i = 0; i < ARRAY_SIZE(kst_allow); i++) {
+        const char* allow = (const char*)((uintptr_t)kst_allow[i] + kaeru_reloc_delta);
+
+        if (strcmp(name, allow) == 0) {
             return 1;
         }
     }
@@ -1829,7 +2114,9 @@ static int kst_flash(const char* name, int row, int ui) {
     uint32_t size = 0;
     uint32_t sum = 0;
     uint32_t want = 0;
+    uint32_t back = 0;
     uint64_t cap;
+    char staged[48];
 
     if (!src) {
         KST_ERR("no %s partition", KBK_PART);
@@ -1839,7 +2126,7 @@ static int kst_flash(const char* name, int row, int ui) {
         KST_ERR("no %s partition", name);
     }
 
-    if (kst_read_header(&size, &sum)) {
+    if (kst_read_header(&size, &sum, staged, sizeof(staged))) {
         KST_ERR("nothing staged in %s", KBK_PART);
     }
 
@@ -1861,8 +2148,21 @@ static int kst_flash(const char* name, int row, int ui) {
         KST_ERR("writing %s failed", name);
     }
 
-    printf("kaeru: flash: %u bytes staged in %s written to %s\n", (unsigned)size, KBK_PART,
-           name);
+    // Read the target back off the storage and compare it with the source hash
+    // kbk_copy() computed. This unit refuses 'oem dump', so an unverified flash
+    // is otherwise taken entirely on trust; the read-back is a fresh DMA
+    // transfer, not a cache hit.
+    if (ui) {
+        menu_line(row, " Verifying...");
+        menu_present();
+    }
+
+    if (kbk_hash_region(dst, 0, size, &back) || back != want) {
+        KST_ERR("%s read back %08X != written %08X", name, (unsigned)back, (unsigned)want);
+    }
+
+    printf("kaeru: flash: %s: %u bytes written and verified in %s\n",
+           staged[0] ? staged : "staged image", (unsigned)size, name);
     return 0;
 }
 
@@ -1874,116 +2174,355 @@ static void kst_clear(void) {
     }
 }
 
-// The target picker: a scrollable list, one entry per partition (minus the
-// denied ones), with "Back to menu" first so it is always escapable. Runs
-// inside the menu thread, so fastboot keeps working alongside it.
+// The pickers and the staged-flash screen share the same box: a title and a
+// subtitle line, then the visible window of the list, then the hint.
+#define PICK_TOP     2
+#define PICK_TITLE   3
+#define PICK_SUB     4
+#define PICK_ITEM0   5
+#define PICK_HINT    (PICK_ITEM0 + KST_VISIBLE)   // 25
+#define PICK_BOTTOM  (PICK_HINT + 1)              // 26
+
+// What menu_pick() draws, and what pick_draw() needs to render one frame.
+struct pick_state {
+    const struct part_info* const* parts;  // entries after the "Back" row
+    int n;                                 // partitions follow row 0
+    const char* back;                      // row 0's label
+    const char* title;
+    const char* sub;
+    const char* hint;
+    int top;                               // first visible row
+};
+
+// One frame of a boxed list picker: header, the scrolled window, footer. Called
+// on every move so a held key slides through the list.
+static void pick_draw(int sel, void* v) {
+    struct pick_state* s = v;
+    int r = PICK_ITEM0;
+
+    // Keep the selected row inside the visible window.
+    if (sel < s->top) {
+        s->top = sel;
+    }
+    if (sel >= s->top + KST_VISIBLE) {
+        s->top = sel - KST_VISIBLE + 1;
+    }
+
+    menu_rule(PICK_TOP);
+    menu_box_line(PICK_TITLE, '|', '|', s->title);
+    menu_box_line(PICK_SUB, '|', '|', s->sub);
+
+    for (int i = 0; i < KST_VISIBLE; i++) {
+        int idx = s->top + i;
+        char line[64];
+
+        if (idx == 0) {
+            npf_snprintf(line, sizeof(line), " %s %s", (idx == sel) ? ">>" : "  ", s->back);
+        } else if (idx <= s->n) {
+            const struct part_info* p = s->parts[idx - 1];
+
+            npf_snprintf(line, sizeof(line), " %s %-20s %4uM", (idx == sel) ? ">>" : "  ", p->name,
+                         (unsigned)(((uint64_t)p->size_blocks * BLOCK_SIZE) >> 20));
+        } else {
+            line[0] = '\0';
+        }
+
+        menu_box_line(r + i, '|', '|', line);
+    }
+
+    menu_box_line(PICK_HINT, '|', '|', s->hint);
+    menu_rule(PICK_BOTTOM);
+    menu_present();
+}
+
+// The shared list picker: taps and holds on the volume keys move the selection,
+// a Power hold commits. Returns the selected index (0 is the "Back" row).
+static int menu_pick(struct pick_state* s) {
+    int sel = 0;
+
+    pick_draw(sel, s);
+
+    for (;;) {
+        // menu_move_keys() redraws each step, so only act when nothing moved.
+        if (!menu_move_keys(s->n + 1, &sel, pick_draw, s)) {
+            if (!mtk_detect_key(KEY_POWER)) {
+                mdelay(MENU_POLL_MS);
+                continue;
+            }
+
+            menu_box_line(PICK_HINT, '|', '|', " Hold Power to select...");
+            menu_present();
+
+            if (menu_hold_power()) {
+                return sel;
+            }
+
+            pick_draw(sel, s);  // released too early
+        }
+
+        mdelay(MENU_POLL_MS);
+    }
+}
+
+// The target picker: the boot images in kst_allow, with "Back to menu" first so
+// it is always escapable. Runs inside the menu thread, so fastboot keeps
+// working alongside it.
 static void kst_pick(int ui) {
     const struct part_info* parts[PARTS_MAX];
-    int count = storage_part_count();
-    int n = 0;
+    struct pick_state st;
+    char sub[64];
+    char line[64];
+    char staged[48];
     uint32_t size = 0;
     uint32_t sum = 0;
-    int have = (kst_read_header(&size, &sum) == 0);
-    int items;
-    int sel = 0;
-    int top = 0;
-    int done = 0;
-    char line[64];
+    int have = (kst_read_header(&size, &sum, staged, sizeof(staged)) == 0);
+    int count = storage_part_count();
+    int n = 0;
+    int sel;
 
     for (int i = 0; i < count && n < (int)ARRAY_SIZE(parts); i++) {
         const struct part_info* p = storage_part_get(i);
 
-        if (p && !kst_denied(p->name)) {
+        if (p && kst_allowed(p->name)) {
             parts[n++] = p;
         }
     }
 
-    items = n + 1;  // entry 0 is "Back to menu"
+    if (have && staged[0]) {
+        npf_snprintf(sub, sizeof(sub), " %s%s", staged, sum ? " (cksum)" : "");
+    } else if (have) {
+        npf_snprintf(sub, sizeof(sub), " staged %u MiB%s", (unsigned)(size >> 20),
+                     sum ? ", cksum" : "");
+    } else {
+        npf_snprintf(sub, sizeof(sub), " no image staged in %s", KBK_PART);
+    }
 
-    while (!done) {
-        int r = 5;
+    if (!have) {
+        // Nothing to flash, so skip the target list: let the user pick a target
+        // and the only possible outcome is kst_flash()'s error.
+        menu_rule(PICK_TOP);
+        menu_box_line(PICK_TITLE, '|', '|', " Flash staged image");
+        menu_box_line(PICK_SUB, '|', '|', sub);
+        menu_box_line(PICK_HINT, '|', '|', " stage one with utils/stage.sh");
+        menu_rule(PICK_BOTTOM);
+        menu_present();
+        mdelay(1800);
+        kst_clear();
+        menu_present();
+        return;
+    }
 
-        menu_line(2, "===== Flash staged image =====");
+    st.parts = parts;
+    st.n = n;
+    st.back = "Back to menu";
+    st.title = " Flash staged image";
+    st.sub = sub;
+    st.hint = " Vol: tap/hold  Power: hold to flash";
+    st.top = 0;
 
-        if (have) {
-            npf_snprintf(line, sizeof(line), "staged %u MiB%s", (unsigned)(size >> 20),
-                         sum ? ", cksum" : "");
-        } else {
-            npf_snprintf(line, sizeof(line), "no image staged in %s", KBK_PART);
+    sel = menu_pick(&st);
+
+    if (sel > 0) {
+        const struct part_info* t = parts[sel - 1];
+        const char* nm = staged[0] ? staged : "staged image";
+        size_t nlen = strlen(nm);
+        int rc;
+
+        // Keep the target visible: the box clips from the right, so long names
+        // show only their tail, which is the part that tells images apart.
+        if (nlen > 20) {
+            nm += nlen - 20;
         }
 
-        menu_line(3, line);
+        npf_snprintf(line, sizeof(line), " %s -> %s", nm, t->name);
+        menu_box_line(PICK_HINT, '|', '|', line);
+        menu_present();
 
-        for (int i = top; i < top + KST_VISIBLE && i < items; i++) {
-            if (i == 0) {
-                npf_snprintf(line, sizeof(line), "%c Back to menu", (i == sel) ? '>' : ' ');
-            } else {
-                const struct part_info* p = parts[i - 1];
+        rc = kst_flash(t->name, PICK_HINT, ui);
 
-                npf_snprintf(line, sizeof(line), "%c %-20s %4uM", (i == sel) ? '>' : ' ',
-                             p->name,
-                             (unsigned)(((uint64_t)p->size_blocks * BLOCK_SIZE) >> 20));
-            }
-
-            menu_line(r++, line);
-        }
-
-        menu_line(26, " Vol: move   Hold Power: flash");
-        mt_disp_update();
-
-        if (mtk_detect_key(KEY_VOLUME_DOWN)) {
-            while (mtk_detect_key(KEY_VOLUME_DOWN)) mdelay(20);
-            sel = (sel + 1) % items;
-        } else if (mtk_detect_key(KEY_VOLUME_UP)) {
-            while (mtk_detect_key(KEY_VOLUME_UP)) mdelay(20);
-            sel = (sel + items - 1) % items;
-        } else if (mtk_detect_key(KEY_POWER)) {
-            menu_line(26, " Hold Power to flash...");
-            mt_disp_update();
-
-            int held = 0;
-
-            while (mtk_detect_key(KEY_POWER) && held < MENU_HOLD_MS) {
-                mdelay(20);
-                held += 20;
-            }
-
-            if (held >= MENU_HOLD_MS) {
-                while (mtk_detect_key(KEY_POWER)) mdelay(20);
-
-                if (sel == 0) {
-                    done = 1;
-                } else {
-                    const struct part_info* t = parts[sel - 1];
-                    int rc;
-
-                    npf_snprintf(line, sizeof(line), "Flashing %s", t->name);
-                    menu_line(25, line);
-                    mt_disp_update();
-
-                    rc = kst_flash(t->name, 25, ui);
-
-                    menu_line(25, rc ? kst_reason : "Flash done");
-                    mt_disp_update();
-                    mdelay(1200);
-                    done = 1;
-                }
-            }
-        }
-
-        // Keep the selected row inside the visible window.
-        if (sel < top) {
-            top = sel;
-        }
-        if (sel >= top + KST_VISIBLE) {
-            top = sel - KST_VISIBLE + 1;
-        }
-
-        mdelay(100);
+        menu_box_line(PICK_HINT, '|', '|', rc ? kst_reason : "Flashed + verified");
+        menu_present();
+        mdelay(1200);
     }
 
     kst_clear();
-    mt_disp_update();
+    menu_present();
+}
+
+// ---------------------------------------------------------------------------
+// Copy one partition into another
+//
+// The backup/restore pair above moves the boot images through tranfs; this
+// moves any partition straight into any other, with no staging and no host. It
+// is the offline rescue for a device whose Android is gone: boot the menu, pick
+// a good 'recovery' (or a good slot) as the source, and write it over a broken
+// 'boot'.
+//
+// The whole source partition is copied, so it is refused unless it fits the
+// target, and the target is refused for the same partitions the staged flash
+// refuses (kst_deny).
+// ---------------------------------------------------------------------------
+
+// Why the last kcp_copy() failed, short enough for a menu row. Shares
+// kst_reason: the two flashes never run at once.
+#define KCP_ERR(...)                                               \
+    do {                                                           \
+        npf_snprintf(kst_reason, sizeof(kst_reason), __VA_ARGS__); \
+        printf("kaeru: copy: %s\n", kst_reason);                   \
+        return -1;                                                 \
+    } while (0)
+
+static int kcp_copy(const char* src_name, const char* dst_name, int row, int ui) {
+    const struct part_info* src = storage_part_find(src_name);
+    const struct part_info* dst = storage_part_find(dst_name);
+    uint64_t n;
+    uint32_t sum = 0;
+
+    if (!src) {
+        KCP_ERR("no %s partition", src_name);
+    }
+
+    if (!dst) {
+        KCP_ERR("no %s partition", dst_name);
+    }
+
+    if (strcmp(src->name, dst->name) == 0) {
+        KCP_ERR("source and target are the same");
+    }
+
+    if (kst_denied(dst_name)) {
+        KCP_ERR("%s is protected", dst_name);
+    }
+
+    n = (uint64_t)src->size_blocks * BLOCK_SIZE;
+
+    // kbk_copy takes a 32-bit length; no real image partition comes close.
+    if ((n >> 32) != 0) {
+        KCP_ERR("%s is larger than 4 GiB", src_name);
+    }
+
+    if (n == 0) {
+        KCP_ERR("%s is empty", src_name);
+    }
+
+    if (n > (uint64_t)dst->size_blocks * BLOCK_SIZE) {
+        KCP_ERR("%s does not fit in %s", src_name, dst_name);
+    }
+
+    if (kbk_copy(src, 0, dst, 0, (uint32_t)n, &sum, "Copying", row, ui)) {
+        KCP_ERR("copying %s failed", src_name);
+    }
+
+    printf("kaeru: copy: %s -> %s (%u bytes)\n", src_name, dst_name, (unsigned)n);
+    return 0;
+}
+
+// One side of the picker: scroll the partitions that pass the filter, return the
+// chosen one, or NULL when the user backs out via 'back'. 'skip' is left out of
+// the list (the source, so the target cannot be the same partition); 'deny' also
+// drops the protected destinations. Draws the same block the flash picker does.
+static const struct part_info* kcp_choose(const char* title, const char* sub, const char* back,
+                                          const struct part_info* skip, int deny) {
+    const struct part_info* parts[PARTS_MAX];
+    struct pick_state st;
+    int count = storage_part_count();
+    int n = 0;
+    int sel;
+
+    for (int i = 0; i < count && n < (int)ARRAY_SIZE(parts); i++) {
+        const struct part_info* p = storage_part_get(i);
+
+        if (!p) {
+            continue;
+        }
+
+        if (skip && strcmp(p->name, skip->name) == 0) {
+            continue;
+        }
+
+        if (deny && kst_denied(p->name)) {
+            continue;
+        }
+
+        parts[n++] = p;
+    }
+
+    st.parts = parts;
+    st.n = n;
+    st.back = back;
+    st.title = title;
+    st.sub = sub;
+    st.hint = " Vol: tap/hold  Power: hold to select";
+    st.top = 0;
+
+    sel = menu_pick(&st);
+
+    return (sel == 0) ? NULL : parts[sel - 1];
+}
+
+// The copy's two pickers: source first, then a target that is neither the source
+// nor a protected partition. Backing out of the target picker returns to the
+// source picker, so a wrong source does not send the user all the way back to
+// the main menu. Runs inside the menu thread, so fastboot keeps working.
+static void kcp_pick(int ui) {
+    const struct part_info* src = NULL;
+    const struct part_info* dst;
+    char sub[64];
+    char line[64];
+    int rc;
+
+    for (;;) {
+        if (!src) {
+            src = kcp_choose(" Copy partition", " Pick the source", "Back to menu", NULL, 0);
+
+            if (!src) {
+                break;  // Back from the source picker: leave the copy flow
+            }
+        }
+
+        npf_snprintf(sub, sizeof(sub), " Source: %s", src->name);
+        dst = kcp_choose(" Copy: pick target", sub, "Back to source", src, 1);
+
+        if (!dst) {
+            src = NULL;  // Back to re-pick the source
+            continue;
+        }
+
+        npf_snprintf(line, sizeof(line), " Copying %s -> %s", src->name, dst->name);
+        menu_box_line(PICK_HINT, '|', '|', line);
+        menu_present();
+
+        rc = kcp_copy(src->name, dst->name, PICK_HINT, ui);
+
+        menu_box_line(PICK_HINT, '|', '|', rc ? kst_reason : "Copy done");
+        menu_present();
+        mdelay(1200);
+        break;
+    }
+
+    kst_clear();
+    menu_present();
+}
+
+// 'oem copy <source> <target>': the pickers' copy, for a scripted or host-driven
+// run. Both partitions are named by the parsed table.
+static void cmd_copy(const char* arg, void* data, unsigned sz) {
+    char src[PART_NAME_MAX + 1];
+    char dst[PART_NAME_MAX + 1];
+
+    (void)data;
+    (void)sz;
+
+    arg = next_token(arg, src, sizeof(src));
+    next_token(arg, dst, sizeof(dst));
+
+    if (!src[0] || !dst[0]) {
+        fastboot_fail("Usage: oem copy <source> <target>");
+        return;
+    }
+
+    fastboot_info(kcp_copy(src, dst, 12 + MENU_COUNT, 0) ? kst_reason : "partition copied");
+    fastboot_okay("");
 }
 
 // 'oem info': everything kaeru can tell about this boot, in one place. Read
@@ -2075,7 +2614,65 @@ static void cmd_flash_staged(const char* arg, void* data, unsigned sz) {
         return;
     }
 
-    fastboot_info(kst_flash(name, 12 + MENU_COUNT, 0) ? kst_reason : "staged image flashed");
+    fastboot_info(kst_flash(name, 12 + MENU_COUNT, 0) ? kst_reason : "staged image flashed and verified");
+    fastboot_okay("");
+}
+
+// 'oem verify <partition>': read the partition back and compare it with the
+// staged image, so a flash that happened at some earlier point -- or through a
+// path that could not check itself -- can be confirmed without a working
+// readback command from the host. Flashing already verifies what it writes.
+static void cmd_verify(const char* arg, void* data, unsigned sz) {
+    const struct part_info* src = storage_part_find(KBK_PART);
+    const struct part_info* dst;
+    char name[PART_NAME_MAX + 1];
+    char staged[48];
+    char buf[FASTBOOT_INFO_MAX + 1];
+    uint32_t size = 0;
+    uint32_t want = 0;
+    uint32_t back = 0;
+    uint32_t sum = 0;
+
+    (void)data;
+    (void)sz;
+
+    next_token(arg, name, sizeof(name));
+
+    if (!name[0]) {
+        fastboot_fail("Usage: oem verify <partition>");
+        return;
+    }
+
+    dst = storage_part_find(name);
+
+    if (!src || !dst) {
+        fastboot_fail("Partition not found");
+        return;
+    }
+
+    if (kst_read_header(&size, &sum, staged, sizeof(staged))) {
+        fastboot_info("nothing staged in tranfs");
+        fastboot_okay("");
+        return;
+    }
+
+    if (size > (uint64_t)dst->size_blocks * BLOCK_SIZE) {
+        fastboot_info("staged image is larger than the partition");
+        fastboot_okay("");
+        return;
+    }
+
+    if (kbk_hash_region(src, KBK_OFFSET + KBK_HDR_BYTES, size, &want) ||
+        kbk_hash_region(dst, 0, size, &back) || back != want) {
+        npf_snprintf(buf, sizeof(buf), "%s does not match %s", name, staged[0] ? staged : "staged image");
+        fastboot_info(buf);
+        fastboot_okay("");
+        return;
+    }
+
+    npf_snprintf(buf, sizeof(buf), "%s matches %s (%u MiB)", name, staged[0] ? staged : "staged image",
+                 (unsigned)(size >> 20));
+    fastboot_info(buf);
     fastboot_okay("");
 }
 
@@ -2097,6 +2694,8 @@ static const struct {
         {"oem backup", "Back up boot/vendor_boot to tranfs"},
         {"oem restore", "Restore boot/vendor_boot from tranfs"},
         {"oem flash-staged", "Flash the tranfs-staged image to a partition"},
+        {"oem verify", "Compare a partition with the staged image"},
+        {"oem copy", "Copy one partition's contents into another"},
         {"oem kaeru-version", "Print the kaeru version string"},
         {"oem mem", "Read/write a 32-bit word at an address"},
         {"oem partitions", "Dump the parsed GPT partition table"},
@@ -2147,6 +2746,8 @@ void board_late_init(void) {
     fastboot_register("oem backup", cmd_backup, 1);
     fastboot_register("oem restore", cmd_restore, 1);
     fastboot_register("oem flash-staged", cmd_flash_staged, 1);
+    fastboot_register("oem verify", cmd_verify, 1);
+    fastboot_register("oem copy", cmd_copy, 1);
 
     // Android asks for the bootloader by leaving 'bootonce-bootloader' in the
     // misc BCB rather than rebooting into fastboot directly. Stock LK only knows
